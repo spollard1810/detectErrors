@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from netmiko import ConnectHandler, SSHDetect
 from datetime import datetime
-import ntc_templates
+from ntc_templates.parse import parse_output
 import threading
 import csv
 
@@ -22,7 +22,8 @@ class Device:
 def detect_device(device: Device):
     try:
         #using SSHDetect to detect the device type, defaulting to cisco_ios if no device type is detected - also XE -> cisco_ios
-        device_type = SSHDetect(ip=device.ip, username=device.username, password=device.password).autodetect_device_type()
+        device_type = SSHDetect(ip=device.ip, username=device.username, password=device.password)
+        device_type = device_type.autodetect()
         if device_type == 'cisco_xe':
             device_type = 'cisco_ios'
         device.device_type = device_type
@@ -51,7 +52,7 @@ def get_device_facts(device: Device, connection: ConnectHandler):
         
         # Get interface information
         interface_output = connection.send_command('show interfaces')
-        parsed_interfaces = ntc_templates.parse_output(device.device_type, interface_output)
+        parsed_interfaces = parse_output(platform=device.device_type, command='show interfaces', data=interface_output)
         device.interfaces = sort_interfaces(parsed_interfaces)
         
         return device
