@@ -1,14 +1,43 @@
-import netmiko
-import os
-import time
+import netmiko # Ensure this is netmiko, not netmiko.ConnectHandler for specific exceptions
 import pandas as pd
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
 from netmiko import ConnectHandler, SSHDetect
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 from datetime import datetime
-from ntc_templates.parse import parse_output
+from ntc_templates.parse import parse_output, ParseError # Import ParseError
 import threading
 import csv
+import logging
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
+SSH_TIMEOUT = 15  # Timeout for SSHDetect and initial connection attempts
+AUTH_TIMEOUT = 10 # Timeout for authentication phase in SSHDetect
+SESSION_TIMEOUT = 60 # Netmiko session_timeout
+GLOBAL_DELAY_FACTOR = 2 # General delay factor for send_command
+
+# Common error counter keys that NTC templates might produce.
+# NTC templates usually output numbers as strings.
+ERROR_COUNTER_KEYS = [
+    'crc_errors', 'crc',  # CRC often appears as 'crc_errors' or just 'crc'
+    'input_errors', 'in_errors',
+    'output_errors', 'out_errors',
+    'input_discards', 'in_discards', 'input_drops', # Discards/drops
+    'output_discards', 'out_discards', 'output_drops',
+    'collisions',
+    'late_collisions', 'late_collision',
+    'deferred_transmissions', 'deferred',
+    'giants',
+    'runts',
+    'ignored',
+    'overruns', 'overrun',
+    'frame_errors', 'frame',
+    'aborts', 'abort',
+    'resets', 'interface_resets'
+]
 
 @dataclass
 class Device:
@@ -17,318 +46,492 @@ class Device:
     password: str
     device_type: Optional[str] = None
     hostname: Optional[str] = None
-    interfaces: Optional[Dict[str, Any]] = None
+    # interfaces will now be a list of dicts, each dict for one interface with errors
+    interfaces: List[Dict[str, Any]] = field(default_factory=list)
 
-def detect_device(device: Device):
+def detect_device_type(device: Device) -> Device:
+    logging.info(f"Attempting to detect device type for {device.ip}...")
+    detector_args = {
+        'host': device.ip,
+        'username': device.username,
+        'password': device.password,
+        'timeout': SSH_TIMEOUT,
+        'auth_timeout': AUTH_TIMEOUT,
+    }
     try:
-        print(f"Attempting to detect device type for {device.ip}...")
-        #using SSHDetect to detect the device type, defaulting to cisco_ios if no device type is detected - also XE -> cisco_ios
-        ssh_detect = SSHDetect(ip=device.ip, username=device.username, password=device.password)
-        print(f"SSHDetect object created for {device.ip}")
-        
-        # Get the best match and available device types
-        best_match = ssh_detect.autodetect()
-        print(f"Best match for {device.ip}: {best_match}")
-        
-        # If we get a KeyError, it means the device type wasn't found in the mapping
-        if best_match is None:
-            print("No device type match found, defaulting to cisco_ios")
-            device.device_type = 'cisco_ios'
-        else:
+        guesser = SSHDetect(**detector_args)
+        best_match = guesser.autodetect()
+        logging.info(f"SSHDetect best_match for {device.ip}: {best_match}")
+
+        if best_match:
             if best_match == 'cisco_xe':
-                best_match = 'cisco_ios'
-                print(f"Converting cisco_xe to cisco_ios for {device.ip}")
-            device.device_type = best_match
-            print(f"Successfully set device type for {device.ip} to {device.device_type}")
-            
-    except KeyError as ke:
-        print(f"KeyError during device detection for {device.ip}: {str(ke)}")
-        print("This usually means the device type wasn't found in the mapping")
-        device.device_type = 'cisco_ios'
-        print(f"Defaulting to cisco_ios for {device.ip}")
+                device.device_type = 'cisco_ios' # Consolidate XE to IOS for templates
+                logging.info(f"Mapped cisco_xe to cisco_ios for {device.ip}")
+            else:
+                device.device_type = best_match
+            logging.info(f"Successfully detected device type for {device.ip} as {device.device_type}")
+        else:
+            device.device_type = 'cisco_ios'
+            logging.warning(f"Could not detect device type for {device.ip}, defaulting to 'cisco_ios'.")
+
+    except (NetmikoTimeoutException, ConnectionRefusedError):
+        logging.error(f"Timeout/Connection refused detecting device type for {device.ip}. Defaulting to 'cisco_ios'.")
+        device.device_type = 'cisco_ios' # Default on common connection errors
+    except NetmikoAuthenticationException:
+        logging.error(f"Authentication failed detecting device type for {device.ip}. Defaulting to 'cisco_ios'.")
+        device.device_type = 'cisco_ios' # Default on auth errors
     except Exception as e:
-        print(f"Error detecting device type for {device.ip}: {str(e)}")
-        print(f"Error type: {type(e).__name__}")
+        logging.error(f"Error detecting device type for {device.ip}: {str(e)} ({type(e).__name__}). Defaulting to 'cisco_ios'.")
         device.device_type = 'cisco_ios'
-        print(f"Defaulting to cisco_ios for {device.ip}")
     return device
 
-def connect_to_device(device: Device) -> ConnectHandler:
+def connect_to_device(device: Device) -> Optional[ConnectHandler]:
+    if not device.device_type:
+        logging.error(f"Cannot connect to {device.ip}: device_type not set.")
+        return None
+    logging.info(f"Connecting to {device.ip} ({device.hostname or 'IP'}) as {device.device_type}...")
+    connection_params = {
+        'device_type': device.device_type,
+        'host': device.ip,
+        'username': device.username,
+        'password': device.password,
+        'timeout': SSH_TIMEOUT, # For the initial connection
+        'session_timeout': SESSION_TIMEOUT, # For the established session
+        'global_delay_factor': GLOBAL_DELAY_FACTOR,
+        'banner_timeout': 15,
+        'auth_timeout': AUTH_TIMEOUT,
+    }
     try:
-        return ConnectHandler(
-            ip=device.ip,
-            username=device.username,
-            password=device.password,
-            device_type=device.device_type
-        )
+        connection = ConnectHandler(**connection_params)
+        logging.info(f"Successfully connected to {device.ip}.")
+        # Attempt to get hostname from prompt if not already set
+        if not device.hostname:
+            prompt = connection.base_prompt
+            if prompt:
+                device.hostname = prompt.replace("#", "").replace(">", "").strip()
+                logging.info(f"Retrieved hostname '{device.hostname}' from prompt for {device.ip}")
+        return connection
+    except (NetmikoTimeoutException, ConnectionRefusedError) as e:
+        logging.error(f"Timeout/Connection refused connecting to {device.ip} ({device.hostname or 'IP'}): {e}")
+    except NetmikoAuthenticationException as e:
+        logging.error(f"Authentication failed for {device.ip} ({device.hostname or 'IP'}): {e}")
     except Exception as e:
-        print(f"Error connecting to {device.ip}: {e}")
-        raise
+        logging.error(f"Error connecting to {device.ip} ({device.hostname or 'IP'}): {str(e)} ({type(e).__name__})")
+    return None
 
-def get_device_facts(device: Device, connection: ConnectHandler):
+def get_device_facts(device: Device, connection: ConnectHandler) -> Device:
+    logging.info(f"Getting facts for {device.hostname or device.ip}...")
     try:
-        # Get hostname
-        hostname_output = connection.send_command('show run | i hostname')
-        device.hostname = hostname_output.split('hostname ')[-1].strip()
-        
+        # Get hostname if not already set (e.g. from prompt or if detection failed to get it)
+        if not device.hostname:
+            # A more robust way to get hostname if not from prompt
+            try:
+                hostname_output = connection.send_command('show version', use_textfsm=True) # TextFSM often gets hostname
+                if isinstance(hostname_output, list) and hostname_output and 'hostname' in hostname_output[0]:
+                    device.hostname = hostname_output[0]['hostname']
+                    logging.info(f"Got hostname '{device.hostname}' via show version for {device.ip}")
+                else: # Fallback to trying 'show run | i hostname'
+                    hostname_output_raw = connection.send_command('show run | i hostname', use_textfsm=False, use_genie=False)
+                    if 'hostname ' in hostname_output_raw:
+                        device.hostname = hostname_output_raw.split('hostname ')[1].strip().split('\n')[0]
+                        logging.info(f"Got hostname '{device.hostname}' via show run for {device.ip}")
+            except Exception as e_host:
+                logging.warning(f"Could not determine hostname via commands for {device.ip}: {e_host}")
+        if not device.hostname: # Final fallback for hostname
+            device.hostname = device.ip
+            logging.warning(f"Hostname for {device.ip} defaulted to IP address.")
+
         # Get interface information
-        interface_output = connection.send_command('show interfaces')
-        parsed_interfaces = parse_output(platform=device.device_type, command='show interfaces', data=interface_output)
-        device.interfaces = sort_interfaces(parsed_interfaces)
+        # Use TextFSM/Genie if available for 'show interfaces' as it's generally more reliable
+        # Platform string needs to be accurate for ntc-templates
+        platform_for_parsing = device.device_type
+        if platform_for_parsing == "cisco_ios" and "XE" in connection.send_command("show version", use_textfsm=False, use_genie=False):
+             # Heuristic: if it's IOS XE, specific templates might be better if available under cisco_xe
+             # However, for 'show interfaces', 'cisco_ios' template is often generic enough.
+             # For simplicity, we'll stick to the detected/mapped type.
+             pass
+
+        interface_output_raw = connection.send_command('show interfaces', use_textfsm=False, use_genie=False)
         
-        return device
+        try:
+            # NTC-templates expects the platform string Netmiko uses
+            parsed_interfaces_list = parse_output(
+                platform=platform_for_parsing,
+                command='show interfaces',
+                data=interface_output_raw
+            )
+            if parsed_interfaces_list:
+                logging.info(f"Successfully parsed 'show interfaces' for {device.hostname}. Found {len(parsed_interfaces_list)} interfaces.")
+                device.interfaces = filter_interfaces_with_errors(parsed_interfaces_list)
+                logging.info(f"Found {len(device.interfaces)} interfaces with errors for {device.hostname}.")
+            else:
+                logging.warning(f"Parsing 'show interfaces' for {device.hostname} returned no data.")
+                device.interfaces = []
+        except ParseError as pe:
+            logging.error(f"NTC ParseError for 'show interfaces' on {device.hostname} ({platform_for_parsing}): {pe}. Raw output snippet: {interface_output_raw[:200]}")
+            device.interfaces = [] # Ensure it's an empty list on parse failure
+        except Exception as e_parse:
+            logging.error(f"Unexpected error parsing 'show interfaces' for {device.hostname}: {e_parse}")
+            device.interfaces = []
+
     except Exception as e:
-        print(f"Error getting facts for {device.ip}: {e}")
-        raise
+        logging.error(f"Error getting facts for {device.hostname or device.ip}: {e}")
+        # Ensure interfaces is an empty list if facts gathering fails significantly
+        device.interfaces = []
+    return device
 
-def sort_interfaces(interfaces: dict):
-    # Filter interfaces to only include those with common error counters
-    filtered_interfaces = {}
-    for interface, data in interfaces.items():
-        # Check for common error counters
+def filter_interfaces_with_errors(parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    interfaces_with_errors = []
+    if not isinstance(parsed_data, list):
+        logging.warning(f"Expected a list from parse_output, got {type(parsed_data)}. Skipping interface filtering.")
+        return []
+
+    for interface_details in parsed_data:
+        if not isinstance(interface_details, dict):
+            logging.warning(f"Skipping non-dictionary item in parsed interface data: {type(interface_details)}")
+            continue
+
         has_errors = False
-        
-        # Common error counters to check
-        error_counters = {
-            'crc': data.get('crc', 0),
-            'input_errors': data.get('input_errors', 0),
-            'output_errors': data.get('output_errors', 0),
-            'input_drops': data.get('input_drops', 0),
-            'output_drops': data.get('output_drops', 0),
-            'input_collisions': data.get('input_collisions', 0),
-            'output_collisions': data.get('output_collisions', 0),
-            'late_collisions': data.get('late_collisions', 0),
-            'deferred': data.get('deferred', 0),
-            'giants': data.get('giants', 0),
-            'runts': data.get('runts', 0),
-            'ignored': data.get('ignored', 0),
-            'overrun': data.get('overrun', 0),
-            'abort': data.get('abort', 0),
-            'resets': data.get('resets', 0)
-        }
-        
-        # Check if any error counter is >= 1
-        for counter, value in error_counters.items():
-            if value >= 1:
-                has_errors = True
-                break
-        
-        if has_errors:
-            filtered_interfaces[interface] = data
-    
-    return filtered_interfaces
+        interface_name = interface_details.get('interface', interface_details.get('port', 'UnknownInterface'))
 
-def prepare_dataframe(devices: list[Device]) -> pd.DataFrame:
+        for key in ERROR_COUNTER_KEYS:
+            value_str = interface_details.get(key)
+            if value_str is not None: # Key exists
+                try:
+                    # NTC templates usually give numbers as strings.
+                    # Some values might be non-numeric like 'n/a' or empty string.
+                    if isinstance(value_str, str) and value_str.strip().isdigit():
+                        if int(value_str) >= 1:
+                            has_errors = True
+                            break
+                    elif isinstance(value_str, (int, float)): # Already a number
+                        if value_str >= 1:
+                            has_errors = True
+                            break
+                except ValueError:
+                    logging.debug(f"Could not convert value '{value_str}' for key '{key}' to int on {interface_name}.")
+                except TypeError: # if value_str is not string or number
+                    logging.debug(f"Unexpected type for value '{value_str}' for key '{key}' on {interface_name}: {type(value_str)}")
+
+
+        if has_errors:
+            interfaces_with_errors.append(interface_details)
+            logging.debug(f"Interface {interface_name} has errors, adding to report.")
+            
+    return interfaces_with_errors
+
+
+def prepare_dataframe(devices: List[Device]) -> pd.DataFrame:
     rows = []
     for device in devices:
-        if device.interfaces:
-            for interface, data in device.interfaces.items():
+        if device.hostname and device.interfaces: # Ensure interfaces list is not empty
+            for interface_data in device.interfaces:
+                # Ensure 'interface' column is present, NTC might use 'port' or 'name'
+                if 'interface' not in interface_data:
+                    if 'port' in interface_data:
+                        interface_data['interface'] = interface_data['port']
+                    elif 'name' in interface_data: # Less common for physical interfaces
+                         interface_data['interface'] = interface_data['name']
+                    else: # Fallback if no clear interface identifier
+                        interface_data['interface'] = 'Unknown'
+
                 row = {
                     'hostname': device.hostname,
                     'ip': device.ip,
-                    'interface': interface,
-                    **data
+                    # 'interface': interface_data.get('interface', 'N/A'), # Now handled above
+                    **interface_data # Spread all keys from interface_data
                 }
                 rows.append(row)
+    if not rows:
+        logging.warning("No data to prepare for DataFrame. All devices might have failed or had no interfaces with errors.")
+        # Return an empty DataFrame with expected columns if you want to handle empty reports gracefully
+        # Or, handle this upstream before calling save_data/save_html
+        return pd.DataFrame()
+        
     return pd.DataFrame(rows)
 
-def save_data(df: pd.DataFrame):
+def save_data_csv(df: pd.DataFrame, prefix: str = 'interface_errors'):
+    if df.empty:
+        logging.info("DataFrame is empty. Skipping CSV save.")
+        return
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'interface_errors_{timestamp}.csv'
-    df.to_csv(filename, index=False)
-    print(f"Data saved to {filename}")
+    filename = f'{prefix}_{timestamp}.csv'
+    try:
+        df.to_csv(filename, index=False)
+        logging.info(f"Data saved to {filename}")
+    except Exception as e:
+        logging.error(f"Failed to save CSV {filename}: {e}")
+
 
 def get_creds():
-    #get the credentials from the user
     username = input("Enter the username: ")
-    password = input("Enter the password: ")
+    password = input("Enter the password: ") # Consider using getpass for password input
     return username, password
 
-def load_devices():
+def load_devices_from_csv(filepath: str = 'devices.csv') -> List[Device]:
     devices = []
     username, password = get_creds()
-    #creating list of devices from devices.csv and prompting user for credentials
-    with open('devices.csv', 'r') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            device = Device(ip=row[0], username=username, password=password)
-            devices.append(device)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as file:
+            reader = csv.reader(file)
+            header = next(reader, None) # Skip header if present
+            if header and header[0].lower().strip() in ['ip', 'host', 'deviceip']: # Basic header check
+                logging.info(f"Skipped header in {filepath}: {header}")
+            else: # No header or not a recognized one, rewind and process first line
+                file.seek(0)
+
+            for i, row in enumerate(reader):
+                if row: # Ensure row is not empty
+                    ip_address = row[0].strip()
+                    if ip_address: # Ensure IP is not empty string
+                        devices.append(Device(ip=ip_address, username=username, password=password))
+                    else:
+                        logging.warning(f"Skipping empty IP address in {filepath} at row {i+1 (+1 if header was skipped)}")
+                else:
+                    logging.warning(f"Skipping empty row in {filepath} at row {i+1 (+1 if header was skipped)}")
+    except FileNotFoundError:
+        logging.error(f"Device file '{filepath}' not found.")
+    except Exception as e:
+        logging.error(f"Error reading device file '{filepath}': {e}")
     return devices
 
-def worker(device: Device):
+def worker(device_in: Device, results_list: list, lock: threading.Lock):
+    processed_device = None
     try:
         # Step 1: Detect device type
-        device = detect_device(device)
+        device_with_type = detect_device_type(device_in) # Renamed function
         
-        # Step 2: Connect to device
-        connection = connect_to_device(device)
-        
-        # Step 3: Get device facts
-        device = get_device_facts(device, connection)
-        
-        # Step 4: Close connection
-        connection.disconnect()
-        
-        return device
-    except Exception as e:
-        print(f"Error processing device {device.ip}: {e}")
-        return None
+        if not device_with_type.device_type:
+            logging.error(f"Skipping {device_in.ip} due to no device type detected.")
+            return # Exit if no device type could be determined
 
-def toSortableHTML(df: pd.DataFrame):
-    # Add CSS and JavaScript for sorting
+        # Step 2: Connect to device
+        connection = connect_to_device(device_with_type) # Renamed function
+        
+        if connection:
+            try:
+                # Step 3: Get device facts (hostname, interfaces with errors)
+                processed_device = get_device_facts(device_with_type, connection)
+            finally:
+                # Step 4: Close connection
+                connection.disconnect()
+                logging.info(f"Disconnected from {processed_device.hostname if processed_device else device_in.ip}.")
+        else:
+            logging.warning(f"Could not connect to {device_in.ip}, skipping facts gathering.")
+            # Keep device_in data but it won't have interfaces
+            processed_device = device_with_type # Store it so we know it was attempted
+
+    except Exception as e:
+        logging.error(f"Unhandled error in worker for device {device_in.ip}: {e}", exc_info=True)
+        # Store original device info if processing failed catastrophically mid-way
+        processed_device = device_in if not processed_device else processed_device
+    finally:
+        with lock:
+            if processed_device: # Add even if only IP/hostname is available (e.g. connection failed)
+                 results_list.append(processed_device)
+            # else: # if device_in was never assigned to processed_device (should not happen with current logic)
+            #    results_list.append(device_in) # Fallback, less ideal
+
+def to_sortable_html(df: pd.DataFrame, title: str = "Interface Error Report") -> str:
+    if df.empty:
+        logging.info("DataFrame is empty. Generating basic HTML report indicating no data.")
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return f"""
+        <!DOCTYPE html><html><head><title>{title}</title></head>
+        <body><h1>{title}</h1><p>Generated on: {timestamp}</p>
+        <p>No interface errors found or no devices could be processed successfully.</p>
+        </body></html>
+        """
+
     html_template = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Interface Error Report</title>
+        <title>{title}</title>
+        <meta charset="UTF-8">
         <style>
-            table {
-                border-collapse: collapse;
-                width: 100%;
-                margin: 20px 0;
-                font-family: Arial, sans-serif;
-            }
-            th, td {
-                border: 1px solid #ddd;
-                padding: 8px;
-                text-align: left;
-            }
-            th {
-                background-color: #4CAF50;
-                color: white;
-                cursor: pointer;
-            }
-            tr:nth-child(even) {
-                background-color: #f2f2f2;
-            }
-            tr:hover {
-                background-color: #ddd;
-            }
-            .error {
-                color: red;
-                font-weight: bold;
-            }
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #4CAF50; color: white; cursor: pointer; }}
+            tr:nth-child(even) {{ background-color: #f2f2f2; }}
+            tr:hover {{ background-color: #ddd; }}
+            .error {{ color: red; font-weight: bold; }} /* Example: not used by default */
+            caption {{ caption-side: top; font-size: 1.5em; margin-bottom: 10px; text-align: left; }}
         </style>
         <script>
-            function sortTable(n) {
+            function sortTable(n, tableId) {{
                 var table, rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
-                table = document.getElementById("interfaceTable");
+                table = document.getElementById(tableId);
                 switching = true;
                 dir = "asc";
-                while (switching) {
+                // Store the current sort direction on the table header
+                var header = table.getElementsByTagName("TH")[n];
+                if (header.getAttribute("data-sort-dir") === "asc") {{
+                    dir = "desc";
+                    header.setAttribute("data-sort-dir", "desc");
+                }} else {{
+                    dir = "asc";
+                    header.setAttribute("data-sort-dir", "asc");
+                }}
+                // Reset other headers' sort direction
+                var ths = table.getElementsByTagName("TH");
+                for (var j = 0; j < ths.length; j++) {{
+                    if (j !== n) {{ ths[j].removeAttribute("data-sort-dir"); }}
+                }}
+
+                while (switching) {{
                     switching = false;
                     rows = table.rows;
-                    for (i = 1; i < (rows.length - 1); i++) {
+                    for (i = 1; i < (rows.length - 1); i++) {{
                         shouldSwitch = false;
                         x = rows[i].getElementsByTagName("TD")[n];
                         y = rows[i + 1].getElementsByTagName("TD")[n];
-                        if (dir == "asc") {
-                            if (x.innerHTML.toLowerCase() > y.innerHTML.toLowerCase()) {
-                                shouldSwitch = true;
-                                break;
-                            }
-                        } else if (dir == "desc") {
-                            if (x.innerHTML.toLowerCase() < y.innerHTML.toLowerCase()) {
-                                shouldSwitch = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (shouldSwitch) {
+                        
+                        var xContent = x.innerHTML.toLowerCase();
+                        var yContent = y.innerHTML.toLowerCase();
+                        
+                        // Try to sort as numbers if possible
+                        var xNum = parseFloat(xContent);
+                        var yNum = parseFloat(yContent);
+
+                        if (!isNaN(xNum) && !isNaN(yNum)) {{ // Both are numbers
+                            if (dir == "asc") {{
+                                if (xNum > yNum) {{ shouldSwitch = true; break; }}
+                            }} else if (dir == "desc") {{
+                                if (xNum < yNum) {{ shouldSwitch = true; break; }}
+                            }}
+                        }} else {{ // Sort as strings
+                            if (dir == "asc") {{
+                                if (xContent > yContent) {{ shouldSwitch = true; break; }}
+                            }} else if (dir == "desc") {{
+                                if (xContent < yContent) {{ shouldSwitch = true; break; }}
+                            }}
+                        }}
+                    }}
+                    if (shouldSwitch) {{
                         rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
                         switching = true;
                         switchcount++;
-                    } else {
-                        if (switchcount == 0 && dir == "asc") {
-                            dir = "desc";
-                            switching = true;
-                        }
-                    }
-                }
-            }
+                    }} else {{
+                        if (switchcount == 0 && dir == "asc") {{
+                            // If no switching occurred and direction is asc,
+                            // it implies it's already sorted asc or we need to switch to desc
+                            // The logic for toggling dir is now at the start of the function
+                        }}
+                    }}
+                }}
+            }}
         </script>
     </head>
     <body>
-        <h1>Interface Error Report</h1>
+        <h1>{title}</h1>
         <p>Generated on: {timestamp}</p>
-        {table}
+        {table_html}
     </body>
     </html>
     """
     
+    table_id = "interfaceReportTable"
     # Convert DataFrame to HTML
-    table_html = df.to_html(
-        classes='sortable',
+    # escape=False can be a security risk if data comes from untrusted sources.
+    # For internal tools showing device output, it's often acceptable.
+    table_html_content = df.to_html(
+        table_id=table_id,
         index=False,
-        table_id='interfaceTable',
-        escape=False
+        escape=True, # Set to True for safety, False if you need to render HTML within cells
+        na_rep='N/A' # Representation for missing values
     )
     
-    # Add onclick handlers to table headers
-    table_html = table_html.replace('<th>', '<th onclick="sortTable(this.cellIndex)">')
+    # Add onclick handlers to table headers for sorting
+    # This is a bit crude; a proper HTML parser (like BeautifulSoup) would be more robust.
+    header_replacement = f'<th onclick="sortTable(Array.from(this.parentNode.children).indexOf(this), \'{table_id}\')">'
+    table_html_content = table_html_content.replace('<th>', header_replacement)
     
-    # Format the final HTML
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     final_html = html_template.format(
-        timestamp=timestamp,
-        table=table_html
+        title=title,
+        timestamp=timestamp_str,
+        table_html=table_html_content
     )
     
     return final_html
 
-def save_html(html: str):
-    #save the HTML to a file with timestamp
+def save_html_report(html_content: str, prefix: str = 'interface_errors_report'):
+    if not html_content:
+        logging.warning("HTML content is empty. Skipping save.")
+        return
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'interface_errors_{timestamp}.html'
-    with open(filename, 'w') as file:
-        file.write(html)
-    print(f"HTML report saved to {filename}")
+    filename = f'{prefix}_{timestamp}.html'
+    try:
+        with open(filename, 'w', encoding='utf-8') as file:
+            file.write(html_content)
+        logging.info(f"HTML report saved to {filename}")
+    except Exception as e:
+        logging.error(f"Failed to save HTML report {filename}: {e}")
 
 def main():
-    # Step 1: Load devices
-    devices = load_devices()
+    logging.info("Starting interface error detection script.")
+    devices_to_process = load_devices_from_csv()
     
-    # Step 2: Process devices in parallel
+    if not devices_to_process:
+        logging.warning("No devices loaded from CSV. Exiting.")
+        return
+
     threads = []
-    results = []
-    
-    # Create a lock for thread-safe printing
-    print_lock = threading.Lock()
-    
-    def worker_wrapper(device):
-        try:
-            result = worker(device)
-            with print_lock:
-                if result:
-                    results.append(result)
-        except Exception as e:
-            with print_lock:
-                print(f"Thread error for {device.ip}: {e}")
-    
-    # Start threads
-    for device in devices:
-        thread = threading.Thread(target=worker_wrapper, args=(device,))
+    processed_results: List[Device] = [] # Type hint for clarity
+    processing_lock = threading.Lock()
+        
+    for dev_config in devices_to_process:
+        thread = threading.Thread(target=worker, args=(dev_config, processed_results, processing_lock))
         threads.append(thread)
         thread.start()
-    
-    # Step 3: Wait for all threads to complete
+        if len(threads) % 10 == 0: # Optional: limit concurrent threads slightly
+            logging.info(f"Launched {len(threads)} threads. Pausing briefly...")
+            # time.sleep(0.5) # Can help if SSH server has rate limits, but usually not needed.
+
     for thread in threads:
         thread.join()
     
-    # Step 4: Filter out None results (failed devices)
-    successful_devices = [d for d in results if d is not None]
+    logging.info(f"All {len(threads)} processing threads completed.")
     
-    # Step 5: Prepare and save data
+    # Filter out devices where processing might have added them without full success (e.g., only IP, no interfaces)
+    # We are interested in devices for which we at least got a hostname and potentially interfaces.
+    # The current worker logic appends device even if connection failed, so hostname might be just IP.
+    # We only want devices that successfully had interfaces parsed (even if list is empty) for the dataframe.
+    # Devices that failed connection will have device.interfaces as default empty list.
+    # The key is that get_device_facts was attempted and completed.
+    
+    successful_devices = [d for d in processed_results if d.hostname and d.interfaces is not None] # interfaces can be empty list
+    
     if successful_devices:
+        logging.info(f"Preparing data for {len(successful_devices)} successfully processed or partially processed devices.")
         df = prepare_dataframe(successful_devices)
-        # Save both CSV and HTML formats
-        save_data(df)
-        html = toSortableHTML(df)
-        save_html(html)
+        
+        if not df.empty:
+            save_data_csv(df)
+            html_output = to_sortable_html(df)
+            save_html_report(html_output)
+        else:
+            logging.info("DataFrame is empty after processing, no CSV or HTML report with errors generated.")
+            # You might still want an HTML report saying "no errors found"
+            html_output = to_sortable_html(df) # Will generate the "no data" version
+            save_html_report(html_output)
+
     else:
-        print("No devices were successfully processed")
+        logging.warning("No devices were successfully processed to the point of generating a report.")
+        # Generate an empty report page
+        html_output = to_sortable_html(pd.DataFrame())
+        save_html_report(html_output)
+
+    logging.info("Script finished.")
 
 if __name__ == '__main__':
+    # For more verbose Netmiko logging during development/debugging:
+    # netmiko_logger = logging.getLogger("netmiko")
+    # netmiko_logger.setLevel(logging.DEBUG) # Very verbose
+    # handler = logging.StreamHandler()
+    # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # handler.setFormatter(formatter)
+    # netmiko_logger.addHandler(handler)
     main()
-
-        
