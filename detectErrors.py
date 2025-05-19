@@ -26,15 +26,26 @@ def detect_device(device: Device):
         ssh_detect = SSHDetect(ip=device.ip, username=device.username, password=device.password)
         print(f"SSHDetect object created for {device.ip}")
         
-        device_type = ssh_detect.autodetect()
-        print(f"Detected device type for {device.ip}: {device_type}")
+        # Get the best match and available device types
+        best_match = ssh_detect.autodetect()
+        print(f"Best match for {device.ip}: {best_match}")
         
-        if device_type == 'cisco_xe':
-            device_type = 'cisco_ios'
-            print(f"Converting cisco_xe to cisco_ios for {device.ip}")
-        
-        device.device_type = device_type
-        print(f"Successfully set device type for {device.ip} to {device.device_type}")
+        # If we get a KeyError, it means the device type wasn't found in the mapping
+        if best_match is None:
+            print("No device type match found, defaulting to cisco_ios")
+            device.device_type = 'cisco_ios'
+        else:
+            if best_match == 'cisco_xe':
+                best_match = 'cisco_ios'
+                print(f"Converting cisco_xe to cisco_ios for {device.ip}")
+            device.device_type = best_match
+            print(f"Successfully set device type for {device.ip} to {device.device_type}")
+            
+    except KeyError as ke:
+        print(f"KeyError during device detection for {device.ip}: {str(ke)}")
+        print("This usually means the device type wasn't found in the mapping")
+        device.device_type = 'cisco_ios'
+        print(f"Defaulting to cisco_ios for {device.ip}")
     except Exception as e:
         print(f"Error detecting device type for {device.ip}: {str(e)}")
         print(f"Error type: {type(e).__name__}")
