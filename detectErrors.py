@@ -173,7 +173,7 @@ def worker(device: Device):
     except Exception as e:
         print(f"Error processing device {device.ip}: {e}")
         return None
-    
+
 def toSortableHTML(df: pd.DataFrame):
     # Add CSS and JavaScript for sorting
     html_template = """
@@ -291,8 +291,23 @@ def main():
     # Step 2: Process devices in parallel
     threads = []
     results = []
+    
+    # Create a lock for thread-safe printing
+    print_lock = threading.Lock()
+    
+    def worker_wrapper(device):
+        try:
+            result = worker(device)
+            with print_lock:
+                if result:
+                    results.append(result)
+        except Exception as e:
+            with print_lock:
+                print(f"Thread error for {device.ip}: {e}")
+    
+    # Start threads
     for device in devices:
-        thread = threading.Thread(target=lambda d=device: results.append(worker(d)))
+        thread = threading.Thread(target=worker_wrapper, args=(device,))
         threads.append(thread)
         thread.start()
     
