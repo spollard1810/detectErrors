@@ -21,15 +21,25 @@ class Device:
 
 def detect_device(device: Device):
     try:
+        print(f"Attempting to detect device type for {device.ip}...")
         #using SSHDetect to detect the device type, defaulting to cisco_ios if no device type is detected - also XE -> cisco_ios
-        device_type = SSHDetect(ip=device.ip, username=device.username, password=device.password)
-        device_type = device_type.autodetect()
+        ssh_detect = SSHDetect(ip=device.ip, username=device.username, password=device.password)
+        print(f"SSHDetect object created for {device.ip}")
+        
+        device_type = ssh_detect.autodetect()
+        print(f"Detected device type for {device.ip}: {device_type}")
+        
         if device_type == 'cisco_xe':
             device_type = 'cisco_ios'
+            print(f"Converting cisco_xe to cisco_ios for {device.ip}")
+        
         device.device_type = device_type
+        print(f"Successfully set device type for {device.ip} to {device.device_type}")
     except Exception as e:
-        print(f"Error detecting device type for {device.ip}: {e}")
+        print(f"Error detecting device type for {device.ip}: {str(e)}")
+        print(f"Error type: {type(e).__name__}")
         device.device_type = 'cisco_ios'
+        print(f"Defaulting to cisco_ios for {device.ip}")
     return device
 
 def connect_to_device(device: Device) -> ConnectHandler:
